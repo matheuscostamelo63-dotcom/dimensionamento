@@ -1,456 +1,554 @@
+# --------------------------------------------------------------
+# app.py – VERSÃO CORRIGIDA (sem erro 'impacto')
+# --------------------------------------------------------------
+
 import os
-import io
-import math
 import uuid
-import json
-import datetime
-from typing import List, Dict, Any
-from pathlib import Path
-from flask import Flask, request, jsonify, send_file
-from werkzeug.utils import secure_filename
-from dotenv import load_dotenv
-
-# Carrega as variáveis de ambiente do arquivo .env
-# Determina o caminho absoluto do arquivo .env
-BASE_DIR = Path(__file__).resolve().parent
-env_path = BASE_DIR / '.env'
-
-print(f"[DEBUG] Pasta do app.py: {BASE_DIR}")
-print(f"[DEBUG] Procurando .env em: {env_path}")
-print(f"[DEBUG] Arquivo .env existe? {env_path.exists()}")
-
-# Carrega o .env
-load_dotenv(dotenv_path=env_path)
-
-# Verifica se carregou
-print(f"[DEBUG] SUPABASE_URL carregado: {os.environ.get('SUPABASE_URL')}")
-print(f"[DEBUG] SUPABASE_KEY carregado: {'***' if os.environ.get('SUPABASE_KEY') else 'None'}")
-
-# libs científicas e de geração de arquivos
+from datetime import datetime
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
+from PIL import Image, ImageDraw, ImageFont
+from supabase import create_client
+from dotenv import load_dotenv
+from flask import Flask, request, jsonify
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_pdf import PdfPages
-from supabase import create_client, Client
-from werkzeug.security import generate_password_hash, check_password_hash
 
-# ---------------------------------------------------------------------
-# Config / Supabase client
-# ---------------------------------------------------------------------
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-SUPABASE_STORAGE_BUCKET = os.environ.get("SUPABASE_STORAGE_BUCKET", "projects")
+# Config
+load_dotenv()
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "dimensionamento")
+UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    print("\n[ERRO] Variáveis de ambiente não encontradas!")
-    print(f"[ERRO] Certifique-se de que o arquivo .env existe em: {env_path}")
-    print(f"[ERRO] E contém as linhas:")
-    print(f"[ERRO] SUPABASE_URL=sua-url-aqui")
-    print(f"[ERRO] SUPABASE_KEY=sua-chave-aqui")
-    raise EnvironmentError("Você deve definir SUPABASE_URL e SUPABASE_KEY no arquivo .env")
+supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# ============== TABELA DE PRESSÃO DE VAPOR ==============
+PRESSAO_VAPOR_AGUA = {
+    0: 611, 5: 872, 10: 1228, 15: 1705, 20: 2338,
+    25: 3169, 30: 4246, 35: 5628, 40: 7384, 45: 9593,
+    50: 12349, 55: 15758, 60: 19946, 65: 25043, 70: 31201,
+    75: 38595, 80: 47414, 85: 57867, 90: 70182, 95: 84608,
+    100: 101325
+}
 
-# Flask app
-app = Flask(__name__)
-UPLOAD_DIR = BASE_DIR / "uploads"
-UPLOAD_DIR.mkdir(exist_ok=True)
+def get_pressao_vapor(temp):
+    """Interpola pressão de vapor da água em Pa"""
+    if temp <= 0:
+        return 611
+    if temp >= 100:
+        return 101325
+    
+    temps = sorted(PRESSAO_VAPOR_AGUA.keys())
+    for i in range(len(temps)-1):
+        if temps[i] <= temp <= temps[i+1]:
+            t1, t2 = temps[i], temps[i+1]
+            p1, p2 = PRESSAO_VAPOR_AGUA[t1], PRESSAO_VAPOR_AGUA[t2]
+            return p1 + (p2-p1)*(temp-t1)/(t2-t1)
+    return 2338
 
-g_const = 9.81
+# ============== FUNÇÕES HIDRÁULICAS ==============
+def velocity(Q, D):
+    return Q / (np.pi * (D ** 2) / 4) if D > 0 else 0
 
-# -------------------- Helper: Hydraulic functions --------------------
-def area_from_d(D: float) -> float:
-    return math.pi * D**2 / 4.0
+def reynolds(rho, v, D, mu):
+    return rho * v * D / mu if mu > 0 else 0
 
-def velocity(Q: float, D: float) -> float:
-    A = area_from_d(D)
-    return Q / A if A > 0 else 0.0
-
-def reynolds(rho: float, Q: float, D: float, mu: float) -> float:
-    v = velocity(Q, D)
-    if mu == 0 or D == 0:
-        return 0.0
-    return rho * v * D / mu
-
-def colebrook_white(Re: float, eps: float, D: float, f0=0.02, tol=1e-8, maxiter=200) -> float:
-    if Re <= 2300:
-        return 64.0 / max(Re, 1e-12)
-    f = f0
-    for _ in range(maxiter):
-        rhs = -2.0 * math.log10((eps / (3.7 * D)) + (2.51 / (Re * math.sqrt(f))))
-        f_new = 1.0 / (rhs * rhs)
-        if abs(f_new - f) < tol:
-            return f_new
-        f = f_new
-    return swamee_jain(Re, eps, D)
-
-def swamee_jain(Re: float, eps: float, D: float) -> float:
-    if Re <= 0:
-        return 0.03
-    return 0.25 / (math.log10((eps/(3.7*D)) + (5.74 / (Re**0.9)))**2)
-
-def compute_f_safe(Re: float, eps: float, D: float) -> float:
-    try:
-        if Re is None or Re <= 0:
-            return 0.04
-        if Re <= 2300:
-            return 64.0 / max(Re,1e-12)
-        return colebrook_white(Re, eps, D)
-    except Exception:
-        return swamee_jain(Re, eps, D)
-
-def hf_distributed(f: float, L: float, D: float, Q: float) -> float:
-    v = velocity(Q, D)
-    return f * (L / D) * (v**2) / (2.0 * g_const)
-
-def hf_local_by_K(K: float, Q: float, D: float) -> float:
-    v = velocity(Q, D)
-    return K * (v**2) / (2.0 * g_const)
-
-DEFAULT_K_PER_CONNECTION = 0.5
-
-# -------------------- Process list of trechos (sucção/recalque) --------------------
-def process_trechos(Q: float, trechos: List[Dict[str, Any]], rho: float, mu: float) -> Dict[str, Any]:
-    details = []
-    hf_sum = 0.0
-    hl_sum = 0.0
-    reynolds_list = []
-    f_list = []
-    for t in trechos:
-        L = float(t.get('L', 0.0))
-        D = float(t.get('D', 0.0))
-        eps = float(t.get('rug', 0.000045))
-        conexoes = int(t.get('conexoes', 0))
-        Kpc = t.get('K_por_conexao')
-        if Kpc is None:
-            Kpc = DEFAULT_K_PER_CONNECTION
-        Re = reynolds(rho, Q, D, mu)
-        f = compute_f_safe(Re, eps, D)
-        hf = hf_distributed(f, L, D, Q)
-        K_total = conexoes * float(Kpc)
-        hl = hf_local_by_K(K_total, Q, D)
-        hf_sum += hf
-        hl_sum += hl
-        reynolds_list.append(Re)
-        f_list.append(f)
-        details.append({"L":L,"D":D,"eps":eps,"conexoes":conexoes,"K_por_conexao":Kpc,"Re":Re,"f":f,"hf":hf,"hl":hl})
-    return {"details":details,"hf_sum":hf_sum,"hl_sum":hl_sum,"reynolds":reynolds_list,"f_list":f_list}
-
-# -------------------- NPSH calculation --------------------
-def compute_NPSHa(Patm_pa: float, Pvap_pa: float, rho: float, g: float, hs: float, hf_suc: float, v_suc: float)-> float:
-    term_atm = Patm_pa / (rho * g)
-    term_v = (v_suc**2) / (2*g)
-    term_vapor = Pvap_pa / (rho * g)
-    return term_atm + term_v + hs - term_vapor - hf_suc
-
-# -------------------- Supabase helpers --------------------
-def supabase_get_user(access_token: str):
-    """
-    Get user info from Supabase using access_token.
-    Returns dict with user info or None.
-    """
-    try:
-        # supabase.auth.get_user expects an access token (session access_token)
-        user_resp = supabase.auth.get_user(access_token)
-        # the returned object structure depends on supabase-py version
-        # try common shapes:
-        if hasattr(user_resp, "user") and user_resp.user:
-            return user_resp.user
-        # else maybe .data
-        if isinstance(user_resp, dict) and user_resp.get("data"):
-            return user_resp["data"].get("user") or user_resp["data"]
-        return None
-    except Exception:
-        return None
-
-def supabase_upload_file(local_path: str, remote_path: str) -> str:
-    """
-    Upload local_path to Supabase storage (bucket SUPABASE_STORAGE_BUCKET).
-    Returns public URL on success.
-    """
-    with open(local_path, "rb") as f:
-        data = f.read()
-    # remote_path should be unique, e.g. f"projects/{case_id}/plot.png"
-    try:
-        res = supabase.storage.from_(SUPABASE_STORAGE_BUCKET).upload(remote_path, data, {"cacheControl":"3600", "upsert": True})
-        # get public url
-        public_url_resp = supabase.storage.from_(SUPABASE_STORAGE_BUCKET).get_public_url(remote_path)
-        if isinstance(public_url_resp, dict):
-            # supabase-py may return {'publicUrl': '...'} or {'data': {'publicUrl':...}}
-            if public_url_resp.get('publicUrl'):
-                return public_url_resp['publicUrl']
-            if public_url_resp.get('data') and public_url_resp['data'].get('publicUrl'):
-                return public_url_resp['data']['publicUrl']
-        # fallback: construct url (works if set)
-        return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_STORAGE_BUCKET}/{remote_path}"
-    except Exception as e:
-        print("Upload failed:", e)
-        return ""
-
-# -------------------- Auth endpoints (use Supabase Auth) --------------------
-@app.route('/api/cadastrar', methods=['POST'])
-def api_cadastrar():
-    """
-    Body: { email, senha }
-    This endpoint proxies to Supabase Auth sign_up.
-    """
-    try:
-        data = request.get_json(force=True)
-        email = data.get('email')
-        senha = data.get('senha')
-        if not email or not senha:
-            return jsonify({"status":"error","message":"email e senha obrigatórios"}), 400
-        # sign up user (Supabase returns user/session)
-        resp = supabase.auth.sign_up({"email": email, "password": senha})
-        # resp may contain 'data' and 'error'
-        return jsonify({"status":"ok","data": resp}), 201
-    except Exception as e:
-        return jsonify({"status":"error","message":str(e)}), 500
-
-@app.route('/api/login', methods=['POST'])
-def api_login():
-    """
-    Body: { email, senha } -> proxies to Supabase sign_in_with_password
-    Returns session object (contains access_token) that the frontend should store.
-    """
-    try:
-        data = request.get_json(force=True)
-        email = data.get('email')
-        senha = data.get('senha')
-        if not email or not senha:
-            return jsonify({"status":"error","message":"email e senha obrigatórios"}), 400
-        resp = supabase.auth.sign_in_with_password({"email": email, "password": senha})
-        return jsonify({"status":"ok","data": resp})
-    except Exception as e:
-        return jsonify({"status":"error","message":str(e)}), 401
-
-# -------------------- Core compute endpoint --------------------
-@app.route('/api/calcular', methods=['POST'])
-def api_calcular():
-    """
-    Payload (JSON):
-    {
-      "fluido": {"nome": "...","densidade":1000,"viscosidade":0.001,"pressao_atm":101325,"pressao_vapor":2338},
-      "Q": 0.025,
-      "sucção": {"hs": 2.0, "trechos":[{L,D,rug,conexoes, K_por_conexao?}]},
-      "recalque": {"hr": 20.0, "trechos":[...]},
-      "usuario": "email",    # opcional
-      "opcoes": {"margem_npsh":0.5}
+def friction_factor(Re, D, material="pvc"):
+    if Re < 2000:
+        return 64 / max(Re, 1e-12)
+    rugosidades = {
+        "pvc": 0.0015, "aco_novo": 0.045, "ferro_fundido": 0.26,
+        "aco_comercial": 0.046
     }
-    """
+    e = rugosidades.get(material, 0.045) / 1000
+    return (-2 * np.log10(e/(3.7*D) + 5.74/Re**0.9))**(-2)
+
+def hf_distributed(L, D, v, f):
+    return f * (L/D) * (v**2)/(2*9.81)
+
+def hf_local(K, v):
+    return K * (v**2)/(2*9.81)
+
+def npsha(Patm, Pvap, rho, g, P_suc, hs, hf_suc, v):
+    return (P_suc/(rho*g) - Pvap/(rho*g) + hs - hf_suc - v**2/(2*g))
+
+def calculate_hmt_for_scenario(q_val, data, fluido, nivel_suc, nivel_rec, destino_idx=0):
+    """Calcula Hmt para um cenário específico de níveis"""
+    if q_val <= 0:
+        return 0
+    
+    rho = float(fluido.get("densidade", 1000))
+    mu = float(fluido.get("viscosidade", 0.001))
+    suc = data.get("suc", {})
+    
+    # Determina pressão de sucção
+    tipo_res_suc = suc.get("tipo_reservatorio", "aberto")
+    if tipo_res_suc == "pressurizado":
+        P_suc = 101325 + float(suc.get("pressao_manometrica", 0))
+    else:
+        P_suc = 101325
+    
+    # Calcula perdas na sucção
+    hf_suc_g, hl_suc_g = 0.0, 0.0
+    for t in suc.get("trechos", []):
+        L = float(t.get("L", 0))
+        D = float(t.get("D", 0.1))
+        mat = t.get("material", "pvc")
+        conn = int(t.get("conexoes", 0))
+        v_g = velocity(q_val, D)
+        Re_g = reynolds(rho, v_g, D, mu)
+        f_g = friction_factor(Re_g, D, mat)
+        hf_suc_g += hf_distributed(L, D, v_g, f_g)
+        hl_suc_g += hf_local(0.5*conn, v_g)
+    
+    # Recalque (pode ser múltiplo)
+    recalques = data.get("recalque", [])
+    if not isinstance(recalques, list):
+        recalques = [recalques]
+    
+    rec = recalques[destino_idx] if destino_idx < len(recalques) else recalques[0]
+    
+    # Determina pressão de recalque
+    tipo_res_rec = rec.get("tipo_reservatorio", "aberto")
+    if tipo_res_rec == "pressurizado":
+        P_rec = 101325 + float(rec.get("pressao_manometrica", 0))
+    else:
+        P_rec = 101325
+    
+    # Calcula perdas no recalque
+    hf_rec_g, hl_rec_g = 0.0, 0.0
+    for t in rec.get("trechos", []):
+        L = float(t.get("L", 0))
+        D = float(t.get("D", 0.1))
+        mat = t.get("material", "pvc")
+        conn = int(t.get("conexoes", 0))
+        v_g = velocity(q_val, D)
+        Re_g = reynolds(rho, v_g, D, mu)
+        f_g = friction_factor(Re_g, D, mat)
+        hf_rec_g += hf_distributed(L, D, v_g, f_g)
+        hl_rec_g += hf_local(0.5*conn, v_g)
+    
+    # Hmt = diferença de pressão + diferença geométrica + perdas
+    delta_P = (P_rec - P_suc) / (rho * 9.81)
+    delta_h = nivel_rec - nivel_suc
+    perdas = hf_suc_g + hl_suc_g + hf_rec_g + hl_rec_g
+    
+    return delta_P + delta_h + perdas
+
+app = Flask(__name__)
+
+@app.route("/api/calcular", methods=["POST"])
+def api_calcular():
     try:
-        data = request.get_json(force=True)
-        fluido = data.get('fluido', {})
-        Q = float(data.get('Q', 0.0))
-        suc = data.get('sucção') or data.get('suc') or data.get('suction') or {}
-        rec = data.get('recalque') or data.get('rec') or {}
-        usuario = data.get('usuario', "")
-        opcoes = data.get('opcoes', {})
-        margem_npsh = float(opcoes.get('margem_npsh', 0.5))
-        rho = float(fluido.get('densidade', 1000.0))
-        mu = float(fluido.get('viscosidade', 0.001))
-        Patm = float(fluido.get('pressao_atm', 101325.0))
-        Pvap = float(fluido.get('pressao_vapor', 2338.0))
-        hs = float(suc.get('hs', 0.0))
-        hr = float(rec.get('hr', 0.0))
-        trechos_suc = suc.get('trechos', [])
-        trechos_rec = rec.get('trechos', [])
-        # ensure trechos have default values
-        for t in trechos_suc: t.setdefault('rug', 0.000045)
-        for t in trechos_rec: t.setdefault('rug', 0.000045)
-        # process
-        suc_res = process_trechos(Q, trechos_suc, rho, mu)
-        rec_res = process_trechos(Q, trechos_rec, rho, mu)
-        hf_suc = suc_res['hf_sum']; hl_suc = suc_res['hl_sum']
-        hf_rec = rec_res['hf_sum']; hl_rec = rec_res['hl_sum']
-        hf_total = hf_suc + hf_rec
-        hl_total = hl_suc + hl_rec
-        Hmt = hr + hs + hf_total + hl_total
-        P_hid_W = rho * g_const * Q * Hmt
-        # NPSHa - use suction first trecho diameter for velocity if present
-        if trechos_suc and len(trechos_suc) > 0:
-            D_for_v = float(trechos_suc[0].get('D', 0.05))
+        data = request.get_json()
+        if not data:
+            return jsonify({"status": "error", "message": "JSON inválido"}), 400
+        
+        # ===== EXTRAÇÃO DE DADOS =====
+        fluido = data.get("fluido", {})
+        rho = float(fluido.get("densidade", 1000))
+        mu = float(fluido.get("viscosidade", 0.001))
+        mu_cp = mu * 1000
+        temp = float(fluido.get("temperatura", 20))
+        Pvap = get_pressao_vapor(temp)
+        Patm = float(fluido.get("pressao_atm", 101325))
+        
+        Q = float(data.get("Q", 0))
+        if Q <= 0:
+            return jsonify({"status": "error", "message": "Vazão deve ser > 0"}), 400
+        
+        suc = data.get("suc", {})
+        recalques = data.get("recalque", [])
+        if not isinstance(recalques, list):
+            recalques = [recalques]
+        
+        NPSHr_user = float(data.get("NPSHr", 3.0))
+        name = data.get("name", "Projeto")
+        usuario = data.get("usuario", "email@exemplo.com")
+        config_sistema = data.get("configuracao_sistema", "simples")
+        g = 9.81
+        
+        warnings = []
+        errors = []
+        recomendacoes = []
+        
+        # ===== VALIDAÇÕES =====
+        
+        # Viscosidade
+        if mu_cp > 10:
+            warnings.append({
+                "nivel": "ALERTA",
+                "categoria": "Viscosidade",
+                "mensagem": f"Viscosidade de {mu_cp:.1f} cP detectada",
+                "impacto": "Bomba centrifuga tera BAIXA EFICIENCIA",
+                "acao": ["Recomendado: Bomba de deslocamento positivo"]
+            })
+        
+        if mu_cp > 100:
+            errors.append({
+                "nivel": "IMPEDITIVO",
+                "categoria": "Viscosidade",
+                "mensagem": f"Viscosidade {mu_cp:.1f} cP PROIBITIVA",
+                "impacto": "Centrifuga nao funciona adequadamente",
+                "acao": ["NAO USE CENTRIFUGA!", "Use bomba de deslocamento positivo"]
+            })
+        
+        # Pressão de sucção
+        tipo_res_suc = suc.get("tipo_reservatorio", "aberto")
+        if tipo_res_suc == "pressurizado":
+            P_suc = Patm + float(suc.get("pressao_manometrica", 0))
         else:
-            # fallback: use first rec trecho or default
-            D_for_v = float(trechos_rec[0].get('D', 0.05)) if trechos_rec else 0.05
-        v_suc = velocity(Q, D_for_v)
-        NPSHa = compute_NPSHa(Patm, Pvap, rho, g_const, hs, hf_suc, v_suc)
-        NPSHr_user = float(data.get('NPSHr', 0.0)) if data.get('NPSHr') is not None else None
-        cav_ok = None
-        if NPSHr_user:
-            cav_ok = (NPSHa >= (NPSHr_user + margem_npsh))
-        # Build a small plot and pdf and upload to Supabase Storage
-        case_id = uuid.uuid4().hex
-        # Plot system curve
-        Qgrid = np.linspace(max(1e-6, Q*0.1), max(Q*3, Q+1e-6), 200)
-        Hsys = []
-        for qg in Qgrid:
-            sres = process_trechos(qg, trechos_suc, rho, mu)
-            rres = process_trechos(qg, trechos_rec, rho, mu)
-            Hsys.append( (hs + sres['hf_sum'] + sres['hl_sum']) + (hr + rres['hf_sum'] + rres['hl_sum']) )
-        Hsys = np.array(Hsys)
-        H0 = max(Hsys)*1.1 + 1.0
-        Qmax = Qgrid.max()
-        Hpump = H0*(1 - (Qgrid/Qmax)**2)
-        fig, ax = plt.subplots(figsize=(8,5))
-        ax.plot(Qgrid*3600, Hsys, label='Curva do Sistema')
-        ax.plot(Qgrid*3600, Hpump, label='Curva Exemplo da Bomba')
-        op_point = ((Q*3600), ((hs + hf_suc + hl_suc) + (hr + hf_rec + hl_rec)))
-        ax.scatter([op_point[0]],[op_point[1]], color='red', label='Ponto de operação')
-        ax.set_xlabel('Vazão (m³/h)')
-        ax.set_ylabel('Altura (m)')
-        ax.legend(); ax.grid(True)
-        img_local = os.path.join(UPLOAD_DIR, f"{case_id}.png")
-        fig.tight_layout(); plt.savefig(img_local); plt.close(fig)
-        # Create PDF
-        pdf_local = os.path.join(UPLOAD_DIR, f"{case_id}.pdf")
-        with PdfPages(pdf_local) as pdf:
-            fig_txt = plt.figure(figsize=(8.27,11.69))
-            fig_txt.text(0.02,0.98,"Relatório - Dimensionamento de Bomba Centrífuga", fontsize=14, weight='bold', va='top')
-            y=0.95
-            lines = [
-                f"Data: {datetime.datetime.utcnow().isoformat()}",
-                f"Usuario: {usuario}",
-                f"Q (m3/s): {Q}",
-                f"hs (m): {hs}",
-                f"hr (m): {hr}",
-                f"hf_suc (m): {hf_suc:.4f}",
-                f"hl_suc (m): {hl_suc:.4f}",
-                f"hf_rec (m): {hf_rec:.4f}",
-                f"hl_rec (m): {hl_rec:.4f}",
-                f"Hmt (m): {Hmt:.4f}",
-                f"NPSHa (m): {NPSHa:.4f}",
-                f"NPSHr (m): {NPSHr_user if NPSHr_user else 'not provided'}"
-            ]
-            for ln in lines:
-                fig_txt.text(0.02,y,ln,fontsize=10); y -= 0.03
-            pdf.savefig(fig_txt); plt.close(fig_txt)
-            fig2 = plt.figure(figsize=(8.27,6))
-            img = plt.imread(img_local)
-            plt.imshow(img); plt.axis('off'); pdf.savefig(fig2); plt.close(fig2)
-        # Upload files to Supabase storage
-        remote_img_path = f"{case_id}/plot.png"
-        remote_pdf_path = f"{case_id}/report.pdf"
-        img_url = supabase_upload_file(img_local, remote_img_path)
-        pdf_url = supabase_upload_file(pdf_local, remote_pdf_path)
-        # Insert project metadata in Supabase table 'projects'
-        project_row = {
-            "id": case_id,
-            "user_id": usuario or "",
-            "email": usuario or "",
-            "name": data.get('name') or f"Projeto {case_id[:6]}",
-            "summary": f"Q={Q}, Hmt={Hmt:.3f}",
-            "payload": data,
-            "img_path": remote_img_path,
-            "pdf_path": remote_pdf_path,
-            "created_at": datetime.datetime.utcnow().isoformat()
-        }
-        # Insert
+            P_suc = Patm
+        
+        # Níveis
+        nivel_suc_nom = float(suc.get("nivel_nominal", suc.get("hs", 0)))
+        nivel_suc_min = float(suc.get("nivel_min", nivel_suc_nom))
+        nivel_suc_max = float(suc.get("nivel_max", nivel_suc_nom))
+        
+        # Perdas na sucção
+        hf_suc, hl_suc = 0.0, 0.0
+        v_suc_max = 0
+        for t in suc.get("trechos", []):
+            L = float(t.get("L", 0))
+            D = float(t.get("D", 0.1))
+            mat = t.get("material", "pvc")
+            conn = int(t.get("conexoes", 0))
+            v = velocity(Q, D)
+            v_suc_max = max(v_suc_max, v)
+            Re = reynolds(rho, v, D, mu)
+            f = friction_factor(Re, D, mat)
+            hf_suc += hf_distributed(L, D, v, f)
+            hl_suc += hf_local(0.5*conn, v)
+        
+        # Validação velocidade sucção
+        if v_suc_max < 0.5:
+            warnings.append({
+                "nivel": "ATENCAO",
+                "categoria": "Velocidade",
+                "mensagem": f"Velocidade succao baixa: {v_suc_max:.2f} m/s",
+                "impacto": "Risco de sedimentacao",
+                "acao": ["Reduzir diametro da tubulacao"]
+            })
+        
+        if v_suc_max > 3.0:
+            warnings.append({
+                "nivel": "CRITICO",
+                "categoria": "Velocidade",
+                "mensagem": f"Velocidade succao ALTA: {v_suc_max:.2f} m/s",
+                "impacto": "RISCO DE CAVITACAO",
+                "acao": ["Aumentar diametro da tubulacao"]
+            })
+        
+        # ===== CÁLCULO PARA CADA DESTINO =====
+        resultados_destinos = []
+        Hmt_max = 0
+        
+        for idx, rec in enumerate(recalques):
+            destino_id = rec.get("destino_id", f"Destino_{idx+1}")
+            
+            nivel_rec_nom = float(rec.get("nivel_nominal", rec.get("hr", 0)))
+            nivel_rec_min = float(rec.get("nivel_min", nivel_rec_nom))
+            nivel_rec_max = float(rec.get("nivel_max", nivel_rec_nom))
+            
+            tipo_res_rec = rec.get("tipo_reservatorio", "aberto")
+            if tipo_res_rec == "pressurizado":
+                P_rec = Patm + float(rec.get("pressao_manometrica", 0))
+            else:
+                P_rec = Patm
+            
+            hf_rec, hl_rec = 0.0, 0.0
+            v_rec_max = 0
+            for t in rec.get("trechos", []):
+                L = float(t.get("L", 0))
+                D = float(t.get("D", 0.1))
+                mat = t.get("material", "pvc")
+                conn = int(t.get("conexoes", 0))
+                v = velocity(Q, D)
+                v_rec_max = max(v_rec_max, v)
+                Re = reynolds(rho, v, D, mu)
+                f = friction_factor(Re, D, mat)
+                hf_rec += hf_distributed(L, D, v, f)
+                hl_rec += hf_local(0.5*conn, v)
+            
+            if v_rec_max > 5.0:
+                warnings.append({
+                    "nivel": "ALERTA",
+                    "categoria": "Velocidade",
+                    "mensagem": f"Velocidade recalque {destino_id} ALTA: {v_rec_max:.2f} m/s",
+                    "impacto": "Risco de erosao",
+                    "acao": ["Aumentar diametro"]
+                })
+            
+            Hmt_pior = calculate_hmt_for_scenario(Q, data, fluido, nivel_suc_min, nivel_rec_max, idx)
+            Hmt_nom = calculate_hmt_for_scenario(Q, data, fluido, nivel_suc_nom, nivel_rec_nom, idx)
+            Hmt_melhor = calculate_hmt_for_scenario(Q, data, fluido, nivel_suc_max, nivel_rec_min, idx)
+            
+            Hmt_max = max(Hmt_max, Hmt_pior)
+            
+            D_suc = float(suc.get("trechos", [{}])[0].get("D", 0.1))
+            v_suc = velocity(Q, D_suc)
+            NPSHa_val = npsha(Patm, Pvap, rho, g, P_suc, nivel_suc_min, hf_suc, v_suc)
+            cav_ok = bool(float(NPSHa_val) > float(NPSHr_user + 0.5))
+            
+            resultados_destinos.append({
+                "destino_id": destino_id,
+                "Hmt_pior": float(round(Hmt_pior, 2)),
+                "Hmt_nominal": float(round(Hmt_nom, 2)),
+                "Hmt_melhor": float(round(Hmt_melhor, 2)),
+                "hf_rec": float(round(hf_rec, 4)),
+                "hl_rec": float(round(hl_rec, 4)),
+                "v_rec_max": float(round(v_rec_max, 2)),
+                "NPSHa": float(round(NPSHa_val, 2)),
+                "cavitation_ok": cav_ok
+            })
+        
+        Hmt = Hmt_max
+        P_hid_W = rho * g * Q * Hmt
+        P_bar = Hmt * 0.0981
+        
+        # Validações adicionais
+        if Hmt > 200:
+            warnings.append({
+                "nivel": "CRITICO",
+                "categoria": "Pressao",
+                "mensagem": f"Pressao {Hmt:.1f} mCA ({P_bar:.1f} bar) EXTREMA!",
+                "impacto": "Componentes comuns nao suportam",
+                "acao": ["Tubulacao Schedule 80", "Valvulas 150# minimo"]
+            })
+        
+        if Hmt > 300:
+            errors.append({
+                "nivel": "IMPEDITIVO",
+                "categoria": "Pressao",
+                "mensagem": "Pressao > 300 mCA - centrifuga NAO RECOMENDADA",
+                "impacto": "Risco estrutural",
+                "acao": ["OBRIGATORIO: bomba multistagio"]
+            })
+        
+        if not all(r["cavitation_ok"] for r in resultados_destinos):
+            warnings.append({
+                "nivel": "CRITICO",
+                "categoria": "Cavitacao",
+                "mensagem": "RISCO DE CAVITACAO!",
+                "impacto": "Danos ao rotor",
+                "acao": ["Reduzir perdas na succao", "Aumentar diametro succao"]
+            })
+        
+        if len(recalques) > 1:
+            warnings.append({
+                "nivel": "OBRIGATORIO",
+                "categoria": "Sistema",
+                "mensagem": f"Sistema com {len(recalques)} destinos",
+                "impacto": "Vazao pode nao se distribuir",
+                "acao": ["Instalar valvulas reguladoras"]
+            })
+        
+        # Recomendações
+        recomendacoes.append(f"Bomba com Hmt >= {Hmt:.2f} m na vazao {Q*3600:.2f} m³/h")
+        recomendacoes.append("Verificar curva do fabricante")
+        recomendacoes.append(f"NPSHr da bomba <= {min(r['NPSHa'] for r in resultados_destinos)-0.5:.2f} m")
+        
+        case_id = str(uuid.uuid4())
+        now = datetime.now().strftime("%d/%m/%Y %H:%M")
+        
+        # ===== GRÁFICO =====
+        graph_path = os.path.join(UPLOAD_DIR, f"{case_id}_graph.png")
+        
+        q_range_m3h = np.linspace(0, Q * 3600 * 1.5, 100)
+        q_range_m3s = q_range_m3h / 3600
+        
+        h_pior = [calculate_hmt_for_scenario(q, data, fluido, nivel_suc_min,
+                   recalques[0].get("nivel_max", recalques[0].get("nivel_nominal", recalques[0].get("hr", 0)))) for q in q_range_m3s]
+        h_nominal = [calculate_hmt_for_scenario(q, data, fluido, nivel_suc_nom,
+                      recalques[0].get("nivel_nominal", recalques[0].get("hr", 0))) for q in q_range_m3s]
+        h_melhor = [calculate_hmt_for_scenario(q, data, fluido, nivel_suc_max,
+                     recalques[0].get("nivel_min", recalques[0].get("nivel_nominal", recalques[0].get("hr", 0)))) for q in q_range_m3s]
+        
+        plt.style.use('seaborn-v0_8-whitegrid')
+        fig, ax = plt.subplots(figsize=(14, 8))
+        
+        ax.fill_between(q_range_m3h, h_melhor, h_pior, alpha=0.2, color='#1E40AF',
+                        label='Faixa de Operacao')
+        
+        ax.plot(q_range_m3h, h_pior, '--', color='#DC2626', linewidth=2, label='Pior Caso')
+        ax.plot(q_range_m3h, h_nominal, color='#1E40AF', linewidth=3, label='Nominal')
+        ax.plot(q_range_m3h, h_melhor, '--', color='#059669', linewidth=2, label='Melhor Caso')
+        
+        ax.plot(Q * 3600, Hmt, 'o', markersize=12, color='#D97706',
+                markeredgecolor='black', markeredgewidth=2,
+                label=f'Operacao ({Q*3600:.1f} m³/h, {Hmt:.1f} m)')
+        
+        ax.set_title('Curva do Sistema - Variacao de Niveis', fontsize=18, fontweight='bold', pad=20)
+        ax.set_xlabel('Vazao (m³/h)', fontsize=14, fontweight='bold')
+        ax.set_ylabel('Altura Manometrica (m)', fontsize=14, fontweight='bold')
+        ax.legend(fontsize=11, loc='upper left')
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim(left=0)
+        ax.set_ylim(bottom=0)
+        
+        fig.tight_layout()
+        plt.savefig(graph_path, dpi=200, bbox_inches='tight')
+        plt.close(fig)
+        
+        # ===== PDF =====
+        pdf_path = os.path.join(UPLOAD_DIR, f"{case_id}.pdf")
+        width = 2480
+        height = 9000
+        img = Image.new('RGB', (width, height), color='#FFFFFF')
+        draw = ImageDraw.Draw(img)
+        
         try:
-            resp = supabase.table("projects").insert(project_row).execute()
-        except Exception as e:
-            # If insert fails, still return results but warn
-            print("Supabase insert failed:", e)
-        # Build response
-        resp_json = {
-            "status":"ok",
+            font_title = ImageFont.truetype("arialbd.ttf", 140)
+            font_subtitle = ImageFont.truetype("arial.ttf", 65)
+            font_header = ImageFont.truetype("arialbd.ttf", 70)
+            font_text = ImageFont.truetype("arial.ttf", 52)
+            font_small = ImageFont.truetype("arial.ttf", 46)
+        except:
+            font_title = font_subtitle = font_header = font_text = font_small = ImageFont.load_default()
+        
+        # Cabeçalho
+        for y in range(0, 450):
+            ratio = y / 450
+            r = int(30 + (100-30) * ratio)
+            g = int(64 + (150-64) * ratio)
+            b = int(175 + (220-175) * ratio)
+            draw.line([(0, y), (width, y)], fill=(r, g, b))
+        
+        draw.text((width//2, 150), "RELATORIO DE", fill="#FFFFFF", font=font_title, anchor="mm")
+        draw.text((width//2, 260), "DIMENSIONAMENTO", fill="#FFFFFF", font=font_title, anchor="mm")
+        draw.text((width//2, 350), "Bomba Centrifuga - Analise Completa", fill="#E0E7FF", font=font_subtitle, anchor="mm")
+        
+        y_pos = 520
+        
+        def add_section_header(title):
+            nonlocal y_pos
+            y_pos += 15
+            draw.rectangle([(100, y_pos), (2380, y_pos+90)], fill="#1E40AF")
+            draw.text((140, y_pos+45), title, fill="white", font=font_header, anchor="lm")
+            y_pos += 105
+        
+        def add_alert_box(message, alert_type="warning"):
+            nonlocal y_pos
+            colors = {
+                "warning": ("#FEF3C7", "#F59E0B", "#92400E"),
+                "success": ("#D1FAE5", "#10B981", "#065F46"),
+                "error": ("#FEE2E2", "#EF4444", "#991B1B")
+            }
+            bg, border, text = colors.get(alert_type, colors["warning"])
+            box_height = 90
+            draw.rectangle([(100, y_pos), (2380, y_pos+box_height)], fill=bg, outline=border, width=4)
+            draw.text((140, y_pos+45), message, fill=text, font=font_text, anchor="lm")
+            y_pos += box_height + 15
+        
+        def add_bullet_list(items):
+            nonlocal y_pos
+            for item in items:
+                draw.text((140, y_pos), f"- {item}", fill="#374151", font=font_small, anchor="lm")
+                y_pos += 55
+            y_pos += 20
+        
+        # Conteúdo
+        add_section_header("INFORMACOES")
+        draw.text((140, y_pos), f"Projeto: {name}", fill="#000000", font=font_small, anchor="lm")
+        y_pos += 55
+        draw.text((140, y_pos), f"Data: {now}", fill="#374151", font=font_small, anchor="lm")
+        y_pos += 55
+        
+        add_section_header("STATUS")
+        if errors:
+            add_alert_box(f"{len(errors)} ERRO(S) ENCONTRADO(S)", "error")
+        elif warnings:
+            add_alert_box(f"{len(warnings)} ALERTA(S)", "warning")
+        else:
+            add_alert_box("Sistema OK", "success")
+        
+        add_section_header("RESULTADOS")
+        draw.text((140, y_pos), f"Vazao: {Q*3600:.2f} m³/h", fill="#000000", font=font_small, anchor="lm")
+        y_pos += 55
+        draw.text((140, y_pos), f"Hmt: {Hmt:.2f} m", fill="#000000", font=font_small, anchor="lm")
+        y_pos += 55
+        draw.text((140, y_pos), f"Potencia: {P_hid_W/1000:.2f} kW", fill="#000000", font=font_small, anchor="lm")
+        y_pos += 55
+        draw.text((140, y_pos), f"Temperatura: {temp:.0f} C", fill="#000000", font=font_small, anchor="lm")
+        y_pos += 55
+        draw.text((140, y_pos), f"Viscosidade: {mu_cp:.1f} cP", fill="#000000", font=font_small, anchor="lm")
+        y_pos += 55
+        
+        add_section_header("GRAFICO")
+        try:
+            with Image.open(graph_path) as graph_img:
+                new_width = 2000
+                new_height = int(2000 * graph_img.height / graph_img.width)
+                graph_img = graph_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                img.paste(graph_img, (240, y_pos))
+                y_pos += new_height + 30
+        except:
+            pass
+        
+        if warnings:
+            add_section_header("ALERTAS")
+            for warn in warnings:
+                add_alert_box(f"{warn['categoria']}: {warn['mensagem']}", "warning")
+                # ✅ CORRIGIDO: Verifica se 'impacto' existe
+                if 'impacto' in warn:
+                    draw.text((160, y_pos), f"Impacto: {warn['impacto']}",
+                             fill="#6B7280", font=font_small, anchor="lm")
+                    y_pos += 50
+                add_bullet_list(warn['acao'])
+        
+        if errors:
+            add_section_header("ERROS IMPEDITIVOS")
+            for err in errors:
+                add_alert_box(f"{err['categoria']}: {err['mensagem']}", "error")
+                if 'impacto' in err:
+                    draw.text((160, y_pos), f"Impacto: {err['impacto']}",
+                             fill="#6B7280", font=font_small, anchor="lm")
+                    y_pos += 50
+                add_bullet_list(err['acao'])
+        
+        add_section_header("RECOMENDACOES")
+        add_bullet_list(recomendacoes)
+        
+        img.save(pdf_path, "PDF", resolution=300.0)
+        
+        # Upload
+        with open(pdf_path, "rb") as f:
+            file_data = f.read()
+        remote_path = f"{case_id}/relatorio.pdf"
+        supabase_client.storage.from_(SUPABASE_BUCKET).upload(
+            path=remote_path,
+            file=file_data,
+            file_options={"content-type": "application/pdf"}
+        )
+        pdf_url = supabase_client.storage.from_(SUPABASE_BUCKET).get_public_url(remote_path)
+        
+        # Cleanup
+        try:
+            os.remove(pdf_path)
+            os.remove(graph_path)
+        except:
+            pass
+        
+        return jsonify({
+            "status": "ok" if not errors else "warning",
             "case_id": case_id,
-            "hf_suc": hf_suc,
-            "hl_suc": hl_suc,
-            "hf_rec": hf_rec,
-            "hl_rec": hl_rec,
-            "hf_total": hf_total,
-            "hl_total": hl_total,
-            "H_mt": Hmt,
-            "P_hid_W": P_hid_W,
-            "NPSHa": NPSHa,
-            "NPSHr": NPSHr_user,
-            "reynolds": {"suc": suc_res['reynolds'], "rec": rec_res['reynolds']},
-            "f": {"suc": suc_res['f_list'], "rec": rec_res['f_list']},
-            "img_url": img_url,
-            "pdf_url": pdf_url
-        }
-        if cav_ok is not None:
-            resp_json['cavitation_ok'] = cav_ok
-        return jsonify(resp_json)
+            "pdf_url": str(pdf_url),
+            "temperatura": temp,
+            "viscosidade_cp": mu_cp,
+            "H_mt_nominal": float(round(Hmt, 2)),
+            "pressao_bar": float(round(P_bar, 2)),
+            "P_hid_kW": float(round(P_hid_W/1000, 2)),
+            "velocidade_succao": float(round(v_suc_max, 2)),
+            "resultados_destinos": resultados_destinos,
+            "warnings": warnings,
+            "errors": errors,
+            "recomendacoes": recomendacoes
+        })
+    
     except Exception as e:
-        return jsonify({"status":"error","message":str(e)}), 400
+        import traceback
+        traceback.print_exc()
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-# -------------------- Save project (override metadata) --------------------
-@app.route('/api/salvar_projeto', methods=['POST'])
-def api_salvar_projeto():
-    """
-    Body: { "email": "...", "case_id": "...", "name": "...", "summary": "...", "payload": {..} }
-    Requires auth via Authorization header Bearer <access_token> OR provide email.
-    """
-    try:
-        data = request.get_json(force=True)
-        email = data.get('email')
-        case_id = data.get('case_id')
-        name = data.get('name', f"Projeto {case_id[:6]}" if case_id else "Projeto")
-        summary = data.get('summary', '')
-        payload = data.get('payload', {})
-        if not email or not case_id:
-            return jsonify({"status":"error","message":"email e case_id obrigatorios"}), 400
-        row = {
-            "id": case_id,
-            "user_id": email,
-            "email": email,
-            "name": name,
-            "summary": summary,
-            "payload": payload,
-            "created_at": datetime.datetime.utcnow().isoformat()
-        }
-        resp = supabase.table("projects").upsert(row).execute()
-        return jsonify({"status":"ok","message":"project saved","data": resp.data})
-    except Exception as e:
-        return jsonify({"status":"error","message":str(e)}), 500
-
-# -------------------- List projects --------------------
-@app.route('/api/listar_projetos', methods=['GET'])
-def api_listar_projetos():
-    email = request.args.get('email')
-    if not email:
-        return jsonify({"status":"error","message":"email required"}), 400
-    try:
-        resp = supabase.table("projects").select("*").eq("email", email).execute()
-        return jsonify({"status":"ok","projects": resp.data})
-    except Exception as e:
-        return jsonify({"status":"error","message":str(e)}), 500
-
-# -------------------- Serve public file URLs (optional) --------------------
-@app.route('/api/plot/<case_id>', methods=['GET'])
-def api_plot(case_id):
-    try:
-        # generate public URL if exists
-        remote_img_path = f"{case_id}/plot.png"
-        public_url_resp = supabase.storage.from_(SUPABASE_STORAGE_BUCKET).get_public_url(remote_img_path)
-        if isinstance(public_url_resp, dict):
-            # structure varies
-            url = public_url_resp.get('publicUrl') or (public_url_resp.get('data') or {}).get('publicUrl')
-        else:
-            url = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_STORAGE_BUCKET}/{remote_img_path}"
-        return jsonify({"status":"ok","img_url": url})
-    except Exception as e:
-        return jsonify({"status":"error","message":str(e)}), 404
-
-@app.route('/api/report/<case_id>', methods=['GET'])
-def api_report(case_id):
-    try:
-        remote_pdf_path = f"{case_id}/report.pdf"
-        public_url_resp = supabase.storage.from_(SUPABASE_STORAGE_BUCKET).get_public_url(remote_pdf_path)
-        if isinstance(public_url_resp, dict):
-            url = public_url_resp.get('publicUrl') or (public_url_resp.get('data') or {}).get('publicUrl')
-        else:
-            url = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_STORAGE_BUCKET}/{remote_pdf_path}"
-        return jsonify({"status":"ok","pdf_url": url})
-    except Exception as e:
-        return jsonify({"status":"error","message":str(e)}), 404
-
-# -------------------- Run server --------------------
-if __name__ == '__main__':
-    host = os.environ.get("FLASK_HOST", "0.0.0.0")
-    port = int(os.environ.get("FLASK_PORT", 5000))
-    print("Starting Flask + Supabase backend on", host, port)
-    app.run(host=host, port=port, debug=True)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)

@@ -1,4 +1,81 @@
+
+
+
+
+
+
+
+# Credenciais e configurações sensíveis
 .env
+.env.local
+.env.*.local
+
+# Ambientes virtuais Python
+venv/
+venv*/
+.venv/
+ENV/
+env/
+env*/
+
+# Cache Python
 *.pyc
+*.pyo
+*.pyd
 __pycache__/
+*.so
+*.egg
+*.egg-info/
+.Python
+
+# Arquivos temporários do projeto
+uploads/
+*.pdf
+*.png
+*.jpg
+*.jpeg
+
+# Configurações Flask
 instance/
+.webassets-cache
+
+# Distribuição / build
+dist/
+build/
+*.whl
+
+# Logs
+*.log
+pip-log.txt
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Sistema operacional
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Testes
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Documentação
+docs/_build/
+
+# Arquivos de teste temporários
+data.json
+output.json
