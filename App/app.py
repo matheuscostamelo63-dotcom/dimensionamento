@@ -1,6 +1,10 @@
 # --------------------------------------------------------------
-# app.py – VERSÃO CORRIGIDA (sem erro 'impacto')
+# app.py – VERSÃO PARA PRODUÇÃO (RENDER)
 # --------------------------------------------------------------
+
+# ⚠️ IMPORTANTE: Configurar matplotlib ANTES de importar pyplot
+import matplotlib
+matplotlib.use('Agg')  # Backend sem GUI para servidor
 
 import os
 import uuid
@@ -397,14 +401,25 @@ def api_calcular():
         img = Image.new('RGB', (width, height), color='#FFFFFF')
         draw = ImageDraw.Draw(img)
         
+        # ✅ FONTES COM FALLBACK PARA LINUX
         try:
+            # Tenta fontes do Windows
             font_title = ImageFont.truetype("arialbd.ttf", 140)
             font_subtitle = ImageFont.truetype("arial.ttf", 65)
             font_header = ImageFont.truetype("arialbd.ttf", 70)
             font_text = ImageFont.truetype("arial.ttf", 52)
             font_small = ImageFont.truetype("arial.ttf", 46)
         except:
-            font_title = font_subtitle = font_header = font_text = font_small = ImageFont.load_default()
+            try:
+                # Fontes Linux (Render/PythonAnywhere)
+                font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 140)
+                font_subtitle = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 65)
+                font_header = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 70)
+                font_text = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 52)
+                font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 46)
+            except:
+                # Fallback para fonte padrão
+                font_title = font_subtitle = font_header = font_text = font_small = ImageFont.load_default()
         
         # Cabeçalho
         for y in range(0, 450):
@@ -489,7 +504,6 @@ def api_calcular():
             add_section_header("ALERTAS")
             for warn in warnings:
                 add_alert_box(f"{warn['categoria']}: {warn['mensagem']}", "warning")
-                # ✅ CORRIGIDO: Verifica se 'impacto' existe
                 if 'impacto' in warn:
                     draw.text((160, y_pos), f"Impacto: {warn['impacto']}",
                              fill="#6B7280", font=font_small, anchor="lm")
@@ -550,5 +564,7 @@ def api_calcular():
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
 
+# ✅ PRODUÇÃO: Porta dinâmica + Debug=False
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
