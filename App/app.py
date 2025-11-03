@@ -1,5 +1,5 @@
 # --------------------------------------------------------------
-# app.py – VERSÃO PARA PRODUÇÃO (RENDER)
+# app.py – VERSÃO PARA PRODUÇÃO (RENDER) - COM BASE DE MATERIAIS
 # --------------------------------------------------------------
 
 # ⚠️ IMPORTANTE: Configurar matplotlib ANTES de importar pyplot
@@ -14,6 +14,7 @@ from PIL import Image, ImageDraw, ImageFont
 from supabase import create_client
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import matplotlib.pyplot as plt
 
 # Config
@@ -25,6 +26,136 @@ UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ============== BASE DE DADOS DE MATERIAIS ==============
+MATERIAIS_TUBULACAO = {
+    # Plásticos
+    "pvc": {
+        "nome": "PVC (Policloreto de Vinila)",
+        "rugosidade_mm": 0.0015,
+        "pressao_max_bar": 16,
+        "aplicacao": "Água fria, esgoto, irrigação",
+        "categoria": "Plásticos"
+    },
+    "pead": {
+        "nome": "PEAD (Polietileno Alta Densidade)",
+        "rugosidade_mm": 0.002,
+        "pressao_max_bar": 16,
+        "aplicacao": "Água, gás, saneamento",
+        "categoria": "Plásticos"
+    },
+    "ppr": {
+        "nome": "PPR (Polipropileno Copolímero Random)",
+        "rugosidade_mm": 0.0015,
+        "pressao_max_bar": 25,
+        "aplicacao": "Água quente/fria, aquecimento",
+        "categoria": "Plásticos"
+    },
+    
+    # Aços
+    "aco_carbono_novo": {
+        "nome": "Aço Carbono Novo",
+        "rugosidade_mm": 0.045,
+        "pressao_max_bar": 150,
+        "aplicacao": "Industrial, alta pressão",
+        "categoria": "Aços"
+    },
+    "aco_carbono_usado": {
+        "nome": "Aço Carbono Usado",
+        "rugosidade_mm": 0.15,
+        "pressao_max_bar": 100,
+        "aplicacao": "Industrial (instalações antigas)",
+        "categoria": "Aços"
+    },
+    "aco_comercial": {
+        "nome": "Aço Comercial",
+        "rugosidade_mm": 0.046,
+        "pressao_max_bar": 120,
+        "aplicacao": "Uso geral industrial",
+        "categoria": "Aços"
+    },
+    "aco_galvanizado_novo": {
+        "nome": "Aço Galvanizado Novo",
+        "rugosidade_mm": 0.15,
+        "pressao_max_bar": 100,
+        "aplicacao": "Água potável, proteção contra corrosão",
+        "categoria": "Aços"
+    },
+    "aco_galvanizado_usado": {
+        "nome": "Aço Galvanizado Usado",
+        "rugosidade_mm": 0.40,
+        "pressao_max_bar": 80,
+        "aplicacao": "Instalações antigas",
+        "categoria": "Aços"
+    },
+    "aco_inox": {
+        "nome": "Aço Inoxidável",
+        "rugosidade_mm": 0.015,
+        "pressao_max_bar": 200,
+        "aplicacao": "Alimentos, químicos, alta higiene",
+        "categoria": "Aços"
+    },
+    
+    # Ferros
+    "ferro_fundido_novo": {
+        "nome": "Ferro Fundido Novo",
+        "rugosidade_mm": 0.26,
+        "pressao_max_bar": 25,
+        "aplicacao": "Água, esgoto, adutoras",
+        "categoria": "Ferros"
+    },
+    "ferro_fundido_usado": {
+        "nome": "Ferro Fundido Usado",
+        "rugosidade_mm": 0.50,
+        "pressao_max_bar": 20,
+        "aplicacao": "Sistemas antigos",
+        "categoria": "Ferros"
+    },
+    "ferro_galvanizado": {
+        "nome": "Ferro Galvanizado",
+        "rugosidade_mm": 0.15,
+        "pressao_max_bar": 25,
+        "aplicacao": "Água potável (antigo)",
+        "categoria": "Ferros"
+    },
+    
+    # Outros Materiais
+    "cobre": {
+        "nome": "Cobre",
+        "rugosidade_mm": 0.0015,
+        "pressao_max_bar": 50,
+        "aplicacao": "Água quente/fria, gás, refrigeração",
+        "categoria": "Não-Ferrosos"
+    },
+    "concreto_liso": {
+        "nome": "Concreto Liso",
+        "rugosidade_mm": 0.30,
+        "pressao_max_bar": 10,
+        "aplicacao": "Adutoras, grandes vazões",
+        "categoria": "Concreto"
+    },
+    "concreto_comum": {
+        "nome": "Concreto Comum",
+        "rugosidade_mm": 1.00,
+        "pressao_max_bar": 8,
+        "aplicacao": "Drenagem, esgoto",
+        "categoria": "Concreto"
+    },
+    "fibrocimento": {
+        "nome": "Fibrocimento",
+        "rugosidade_mm": 0.025,
+        "pressao_max_bar": 6,
+        "aplicacao": "Água (uso descontinuado)",
+        "categoria": "Outros"
+    },
+    "vidro": {
+        "nome": "Vidro",
+        "rugosidade_mm": 0.0015,
+        "pressao_max_bar": 10,
+        "aplicacao": "Laboratórios, processos especiais",
+        "categoria": "Outros"
+    }
+}
 
 # ============== TABELA DE PRESSÃO DE VAPOR ==============
 PRESSAO_VAPOR_AGUA = {
@@ -52,28 +183,58 @@ def get_pressao_vapor(temp):
 
 # ============== FUNÇÕES HIDRÁULICAS ==============
 def velocity(Q, D):
+    """Calcula velocidade do fluido"""
     return Q / (np.pi * (D ** 2) / 4) if D > 0 else 0
 
 def reynolds(rho, v, D, mu):
+    """Calcula número de Reynolds"""
     return rho * v * D / mu if mu > 0 else 0
 
-def friction_factor(Re, D, material="pvc"):
+def friction_factor(Re, D, material=None, rugosidade_mm=None):
+    """
+    Calcula fator de atrito de Darcy-Weisbach
+    
+    Args:
+        Re: Número de Reynolds
+        D: Diâmetro interno (m)
+        material: ID do material da base de dados (ex: "pvc")
+        rugosidade_mm: Rugosidade customizada em mm (opcional)
+    
+    Returns:
+        float: Fator de atrito f
+    """
+    # Regime laminar
     if Re < 2000:
         return 64 / max(Re, 1e-12)
-    rugosidades = {
-        "pvc": 0.0015, "aco_novo": 0.045, "ferro_fundido": 0.26,
-        "aco_comercial": 0.046
-    }
-    e = rugosidades.get(material, 0.045) / 1000
-    return (-2 * np.log10(e/(3.7*D) + 5.74/Re**0.9))**(-2)
+    
+    # Determina rugosidade
+    if rugosidade_mm is not None:
+        # Rugosidade customizada fornecida
+        e = rugosidade_mm / 1000  # Converte mm para m
+    elif material and material in MATERIAIS_TUBULACAO:
+        # Usa base de dados
+        e = MATERIAIS_TUBULACAO[material]["rugosidade_mm"] / 1000
+    else:
+        # Default: aço comercial
+        e = 0.045 / 1000
+    
+    # Fórmula de Colebrook-White (aproximação de Swamee-Jain)
+    rugosidade_relativa = e / D
+    termo1 = rugosidade_relativa / 3.7
+    termo2 = 5.74 / (Re ** 0.9)
+    
+    return (-2 * np.log10(termo1 + termo2)) ** (-2)
 
 def hf_distributed(L, D, v, f):
+    """Calcula perda de carga distribuída"""
     return f * (L/D) * (v**2)/(2*9.81)
 
 def hf_local(K, v):
+    """Calcula perda de carga localizada"""
     return K * (v**2)/(2*9.81)
 
 def npsha(Patm, Pvap, rho, g, P_suc, hs, hf_suc, v):
+    """Calcula NPSH disponível"""
     return (P_suc/(rho*g) - Pvap/(rho*g) + hs - hf_suc - v**2/(2*g))
 
 def calculate_hmt_for_scenario(q_val, data, fluido, nivel_suc, nivel_rec, destino_idx=0):
@@ -97,11 +258,12 @@ def calculate_hmt_for_scenario(q_val, data, fluido, nivel_suc, nivel_rec, destin
     for t in suc.get("trechos", []):
         L = float(t.get("L", 0))
         D = float(t.get("D", 0.1))
-        mat = t.get("material", "pvc")
+        mat = t.get("material")
+        rug_custom = t.get("rugosidade_mm")
         conn = int(t.get("conexoes", 0))
         v_g = velocity(q_val, D)
         Re_g = reynolds(rho, v_g, D, mu)
-        f_g = friction_factor(Re_g, D, mat)
+        f_g = friction_factor(Re_g, D, material=mat, rugosidade_mm=rug_custom)
         hf_suc_g += hf_distributed(L, D, v_g, f_g)
         hl_suc_g += hf_local(0.5*conn, v_g)
     
@@ -124,11 +286,12 @@ def calculate_hmt_for_scenario(q_val, data, fluido, nivel_suc, nivel_rec, destin
     for t in rec.get("trechos", []):
         L = float(t.get("L", 0))
         D = float(t.get("D", 0.1))
-        mat = t.get("material", "pvc")
+        mat = t.get("material")
+        rug_custom = t.get("rugosidade_mm")
         conn = int(t.get("conexoes", 0))
         v_g = velocity(q_val, D)
         Re_g = reynolds(rho, v_g, D, mu)
-        f_g = friction_factor(Re_g, D, mat)
+        f_g = friction_factor(Re_g, D, material=mat, rugosidade_mm=rug_custom)
         hf_rec_g += hf_distributed(L, D, v_g, f_g)
         hl_rec_g += hf_local(0.5*conn, v_g)
     
@@ -139,8 +302,53 @@ def calculate_hmt_for_scenario(q_val, data, fluido, nivel_suc, nivel_rec, destin
     
     return delta_P + delta_h + perdas
 
+# ============== FLASK APP ==============
 app = Flask(__name__)
+CORS(app)  # Habilita CORS para todas as rotas
 
+# ============== ENDPOINT: LISTAR MATERIAIS ==============
+@app.route("/api/materiais", methods=["GET"])
+def api_materiais():
+    """
+    Retorna lista de materiais disponíveis na base de dados
+    
+    GET /api/materiais
+    
+    Resposta:
+    [
+        {
+            "id": "pvc",
+            "nome": "PVC (Policloreto de Vinila)",
+            "rugosidade_mm": 0.0015,
+            "pressao_max_bar": 16,
+            "aplicacao": "Água fria, esgoto, irrigação",
+            "categoria": "Plásticos"
+        },
+        ...
+    ]
+    """
+    materiais_lista = []
+    
+    for material_id, dados in MATERIAIS_TUBULACAO.items():
+        materiais_lista.append({
+            "id": material_id,
+            "nome": dados["nome"],
+            "rugosidade_mm": dados["rugosidade_mm"],
+            "pressao_max_bar": dados["pressao_max_bar"],
+            "aplicacao": dados["aplicacao"],
+            "categoria": dados["categoria"]
+        })
+    
+    # Ordena por categoria e depois por nome
+    materiais_lista.sort(key=lambda x: (x["categoria"], x["nome"]))
+    
+    return jsonify({
+        "status": "ok",
+        "total": len(materiais_lista),
+        "materiais": materiais_lista
+    })
+
+# ============== ENDPOINT: CALCULAR ==============
 @app.route("/api/calcular", methods=["POST"])
 def api_calcular():
     try:
@@ -215,12 +423,13 @@ def api_calcular():
         for t in suc.get("trechos", []):
             L = float(t.get("L", 0))
             D = float(t.get("D", 0.1))
-            mat = t.get("material", "pvc")
+            mat = t.get("material")
+            rug_custom = t.get("rugosidade_mm")
             conn = int(t.get("conexoes", 0))
             v = velocity(Q, D)
             v_suc_max = max(v_suc_max, v)
             Re = reynolds(rho, v, D, mu)
-            f = friction_factor(Re, D, mat)
+            f = friction_factor(Re, D, material=mat, rugosidade_mm=rug_custom)
             hf_suc += hf_distributed(L, D, v, f)
             hl_suc += hf_local(0.5*conn, v)
         
@@ -265,12 +474,13 @@ def api_calcular():
             for t in rec.get("trechos", []):
                 L = float(t.get("L", 0))
                 D = float(t.get("D", 0.1))
-                mat = t.get("material", "pvc")
+                mat = t.get("material")
+                rug_custom = t.get("rugosidade_mm")
                 conn = int(t.get("conexoes", 0))
                 v = velocity(Q, D)
                 v_rec_max = max(v_rec_max, v)
                 Re = reynolds(rho, v, D, mu)
-                f = friction_factor(Re, D, mat)
+                f = friction_factor(Re, D, material=mat, rugosidade_mm=rug_custom)
                 hf_rec += hf_distributed(L, D, v, f)
                 hl_rec += hf_local(0.5*conn, v)
             
@@ -403,7 +613,6 @@ def api_calcular():
         
         # ✅ FONTES COM FALLBACK PARA LINUX
         try:
-            # Tenta fontes do Windows
             font_title = ImageFont.truetype("arialbd.ttf", 140)
             font_subtitle = ImageFont.truetype("arial.ttf", 65)
             font_header = ImageFont.truetype("arialbd.ttf", 70)
@@ -411,14 +620,12 @@ def api_calcular():
             font_small = ImageFont.truetype("arial.ttf", 46)
         except:
             try:
-                # Fontes Linux (Render/PythonAnywhere)
                 font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 140)
                 font_subtitle = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 65)
                 font_header = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 70)
                 font_text = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 52)
                 font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 46)
             except:
-                # Fallback para fonte padrão
                 font_title = font_subtitle = font_header = font_text = font_small = ImageFont.load_default()
         
         # Cabeçalho
